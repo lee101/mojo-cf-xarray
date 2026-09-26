@@ -1,0 +1,208 @@
+"""Correctness-gated benchmark for mojo-cf-xarray.
+
+Every case checks agreement with the upstream formulation before timing. The
+baselines are the fastest reasonable NumPy equivalent of the same formula --
+not the `xarray` call, which is dominated by the accessor and the
+`xr.concat` / `transpose` / `drop_attrs` plumbing that this port forwards.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
+
+import mojo_cf_xarray as mcf  # noqa: E402
+
+
+def _time(fn, repeats=7):
+    best = float("inf")
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+def _numpy_bounds_1d(c):
+    """The upstream arithmetic without the xarray wrapper."""
+    d = np.diff(c)
+    padded = np.concatenate(([d[0]], d, [d[-1]]))
+    lower = c - 0.5 * padded[:-1]
+    upper = c + 0.5 * padded[1:]
+    return np.stack((lower, upper), axis=-1)
+
+
+def _numpy_axis_order(c):
+    diffs = np.diff(c)
+    nz = diffs[diffs != 0]
+    if nz.size == 0:
+        return 0
+    if np.all(nz > 0):
+        return 0
+    if np.all(nz < 0):
+        return 1
+    return 2
+
+
+def bench_guess_bounds_1d(n=1 << 22):
+    """Two interleaved edges from a one-sided-difference stencil."""
+    c = np.cumsum(np.full(n, 0.25)) - 0.125 * n
+    expect = _numpy_bounds_1d(c)
+    got = mcf.guess_bounds_1d(c)
+    assert np.allclose(got, expect, rtol=1e-14, atol=1e-12)
+    return (
+        f"guess_bounds_1d n={n}",
+        _time(lambda: _numpy_bounds_1d(c)),
+        _time(lambda: mcf.guess_bounds_1d(c)),
+    )
+
+
+def bench_axis_order(n=1 << 23, kind="ascending"):
+    """The diff / drop-zeros / classify reduction."""
+    if kind == "ascending":
+        c = np.arange(n, dtype=np.float64)
+    elif kind == "repeats":
+        c = np.repeat(np.arange(n // 2, dtype=np.float64), 2)
+    else:
+        c = np.arange(n, dtype=np.float64)[::-1].copy()
+    code = {"ascending": 0, "descending": 1, "repeats": 0}[kind]
+    from mojo_cf_xarray._lib import addr, lib
+
+    out = np.zeros(1, dtype=np.float64)
+    got = lib.cfx_axis_order(n, addr(c), addr(out))
+    assert int(out[0]) == code
+    assert _numpy_axis_order(c) == code
+
+    def ours():
+        out = np.zeros(1, dtype=np.float64)
+        lib.cfx_axis_order(n, addr(c), addr(out))
+        return int(out[0])
+
+    return (
+        f"axis_order n={n} ({kind})",
+        _time(lambda: _numpy_axis_order(c)),
+        _time(ours),
+    )
+
+
+def bench_ocean_s(n=1 << 21):
+    """The only decoder with two transcendental functions."""
+    s = np.linspace(-1.0, 0.0, n)
+    eta = np.full(n, 0.3)
+    depth = np.full(n, 4000.0)
+    a, b, depth_c = 3.0, 0.5, 250.0
+
+    def numpy_s():
+        c = (1 - b) * np.sinh(a * s) / np.sinh(a) + b * (
+            np.tanh(a * (s + 0.5)) / 2 * np.tanh(0.5 * a) - 0.5
+        )
+        return eta * (1 + s) + depth_c * s + (depth - depth_c) * c
+
+    expect = numpy_s()
+    got = mcf.ocean_s(s, eta, depth, a, b, depth_c)
+    assert np.allclose(got, expect, rtol=1e-7, atol=0)
+    return f"ocean_s n={n}", _time(numpy_s), _time(
+        lambda: mcf.ocean_s(s, eta, depth, a, b, depth_c)
+    )
+
+
+def bench_ln_pressure(n=1 << 22):
+    s = np.linspace(0.0, 12.0, n)
+    p0 = 100000.0
+
+    def numpy_ln():
+        return p0 * np.exp(-s)
+
+    expect = numpy_ln()
+    got = mcf.atmosphere_ln_pressure(p0, s)
+    assert np.allclose(got, expect, rtol=1e-7, atol=0)
+    return (
+        f"atmosphere_ln_pressure n={n}",
+        _time(numpy_ln),
+        _time(lambda: mcf.atmosphere_ln_pressure(p0, s)),
+    )
+
+
+def bench_hybrid_sigma(n=1 << 22):
+    b = np.linspace(0.0, 1.0, n)
+    ps = np.full(n, 101325.0)
+
+    def numpy_hybrid():
+        return 20.0 * 100000.0 + b * ps
+
+    expect = numpy_hybrid()
+    got = mcf.atmosphere_hybrid_sigma_pressure(b, ps, a=20.0, p0=100000.0)
+    assert np.allclose(got, expect, rtol=1e-15, atol=0)
+    return (
+        f"atmosphere_hybrid_sigma n={n}",
+        _time(numpy_hybrid),
+        _time(lambda: mcf.atmosphere_hybrid_sigma_pressure(b, ps, a=20.0, p0=100000.0)),
+    )
+
+
+def bench_double_sigma(n=1 << 21):
+    sigma = np.linspace(-1.0, 0.0, n)
+    depth = np.linspace(200.0, 5000.0, n)
+    z1, z2, a, href, k_c = 20.0, 10.0, 0.2, 100.0, -0.5
+
+    def numpy_double():
+        f = 0.5 * (z1 + z2) + 0.5 * (z1 - z2) * np.tanh(
+            2 * a / (z1 - z2) * (depth - href)
+        )
+        return np.where(sigma <= k_c, sigma * f, f + (sigma - 1.0) * (depth - f))
+
+    expect = numpy_double()
+    got = mcf.ocean_double_sigma(sigma, depth, z1, z2, a, href, k_c)
+    assert np.allclose(got, expect, rtol=1e-7, atol=0)
+    return (
+        f"ocean_double_sigma n={n}",
+        _time(numpy_double),
+        _time(lambda: mcf.ocean_double_sigma(sigma, depth, z1, z2, a, href, k_c)),
+    )
+
+
+def bench_extract_flags(n=1 << 22, n_flags=8):
+    """One integer AND per flag over the whole variable."""
+    x = np.random.default_rng(5).integers(0, 2**31, size=n).astype(np.int32)
+    masks = {f"f{i}": (1 << i, None) for i in range(n_flags)}
+    got = mcf.extract_flags(x, masks)
+    for i in range(n_flags):
+        assert np.array_equal(got[f"f{i}"], (x.astype(np.int64) & (1 << i)) != 0)
+
+    def numpy_flags():
+        xi = x.astype(np.int64)
+        return [(xi & (1 << i)) != 0 for i in range(n_flags)]
+
+    return (
+        f"extract_flags n={n} x {n_flags}",
+        _time(numpy_flags, 3),
+        _time(lambda: mcf.extract_flags(x, masks), 3),
+    )
+
+
+CASES = [
+    bench_guess_bounds_1d,
+    bench_axis_order,
+    bench_ln_pressure,
+    bench_hybrid_sigma,
+    bench_ocean_s,
+    bench_double_sigma,
+    bench_extract_flags,
+]
+
+
+def main():
+    print(f"{'case':<38} {'reference':>12} {'mojo':>12} {'speedup':>9}")
+    print("-" * 74)
+    for case in CASES:
+        name, ref, got = case()
+        print(f"{name:<38} {ref * 1e3:>10.2f}ms {got * 1e3:>10.2f}ms {ref / got:>8.2f}x")
+
+
+if __name__ == "__main__":
+    main()
