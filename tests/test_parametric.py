@@ -263,18 +263,20 @@ def test_double_sigma_matches_the_formula(rng):
 
     The upstream decode branches on `self.sigma.k`, and xarray 2026.7.0 has
     removed the `DataArray.k` accessor, so calling it raises. The kernel is
-    therefore checked against the CF formula written out directly, and
+    therefore checked against the CF formula written out directly, with `k`
+    and `sigma` deliberately different so a swapped pair cannot pass, and
     `test_double_sigma_is_unreachable_in_the_installed_xarray` pins why.
     """
     n = 800
     sigma = np.linspace(-1.0, 0.0, n)
+    k = np.linspace(-0.8, 0.1, n)
     depth = rng.uniform(200.0, 5000.0, size=n)
     z1, z2, a, href, k_c = 20.0, 10.0, 0.2, 100.0, -0.5
     f = 0.5 * (z1 + z2) + 0.5 * (z1 - z2) * np.tanh(
         2 * a / (z1 - z2) * (depth - href)
     )
-    expect = np.where(sigma <= k_c, sigma * f, f + (sigma - 1.0) * (depth - f))
-    ours = mcf.ocean_double_sigma(sigma, depth, z1, z2, a, href, k_c)
+    expect = np.where(k <= k_c, sigma * f, f + (sigma - 1.0) * (depth - f))
+    ours = mcf.ocean_double_sigma(k, sigma, depth, z1, z2, a, href, k_c)
     assert_allclose(ours, expect, rtol=TRANSCENDENTAL_RTOL, atol=0)
 
 
@@ -301,18 +303,19 @@ def test_double_sigma_is_unreachable_in_the_installed_xarray():
         ).decode()
 
 
-def test_double_sigma_branch_is_on_sigma_not_on_depth(rng):
-    """A mistaken `depth <= k_c` branch would swap the two sides of the test."""
+def test_double_sigma_branch_is_on_k_not_on_sigma_or_depth(rng):
+    """The condition is `sigma.k <= k_c`; nothing else may decide the branch."""
     depth = np.full(4, 1000.0)
     sigma = np.array([-0.9, -0.6, -0.4, 0.0])
-    got = mcf.ocean_double_sigma(sigma, depth, 20.0, 10.0, 0.2, 100.0, -0.5)
+    k = np.array([0.0, 0.0, -0.6, -0.6])
+    got = mcf.ocean_double_sigma(k, sigma, depth, 20.0, 10.0, 0.2, 100.0, -0.5)
     f = 0.5 * 30.0 + 0.5 * 10.0 * np.tanh(2 * 0.2 / 10.0 * (1000.0 - 100.0))
-    # sigma = (-0.9, -0.6) is at or below k_c = -0.5 and takes sigma * f
-    assert_allclose(got[:2], sigma[:2] * f, rtol=1e-7)
-    # sigma = (-0.4, 0.0) is above it and takes the stretched branch
-    assert_allclose(got[2:], f + (sigma[2:] - 1.0) * (1000.0 - f), rtol=1e-7)
+    # k = (0.0, 0.0) is above k_c = -0.5 and takes the stretched branch
+    assert_allclose(got[:2], f + (sigma[:2] - 1.0) * (1000.0 - f), rtol=1e-7)
+    # k = (-0.6, -0.6) is below it and takes sigma * f
+    assert_allclose(got[2:], sigma[2:] * f, rtol=1e-7)
     # the two branches are far apart here, so a swapped test cannot pass
-    assert not np.allclose(got[:2], f + (sigma[:2] - 1.0) * (1000.0 - f), rtol=1e-3)
+    assert not np.allclose(got[2:], f + (sigma[2:] - 1.0) * (1000.0 - f), rtol=1e-3)
 
 
 def test_decoders_index_matches_the_upstream_transform_table():

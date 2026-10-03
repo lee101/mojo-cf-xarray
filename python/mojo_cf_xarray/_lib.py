@@ -2,7 +2,8 @@
 
 The shared library owns no memory. Every buffer crosses the C ABI as a 64-bit
 address, so the argtypes below must stay `c_int64` for addresses; `c_int`
-truncates them and segfaults once a buffer lands above 4 GiB.
+truncates them and segfaults once a buffer lands above 4 GiB. `simd_width` is
+the one symbol that takes no buffer and returns a double.
 
 Each symbol is wrapped in a `_Checked` callable that refuses an argument count
 other than the declared one: ctypes zero-fills a short `argtypes` list, so a
@@ -25,18 +26,28 @@ _I64 = ctypes.c_int64
 _F64 = ctypes.c_double
 
 _SIGNATURES: dict[str, tuple[object, list[object]]] = {
-    "cfx_affine_decode": (None, [_I64, _I64, _I64, _I64, _I64, _I64]),
-    "cfx_ln_pressure_decode": (None, [_I64, _I64, _I64, _I64]),
-    "cfx_hybrid_sigma_decode": (None, [_I64] * 5 + [_F64] + [_I64] * 2 + [_F64] + [_I64] * 2),
-    "cfx_sleve_decode": (None, [_I64, _I64, _I64, _I64, _I64, _I64, _I64, _I64]),
-    "cfx_s_coordinate_decode": (None, [_I64, _I64, _I64, _I64, _I64, _I64, _F64, _I64, _I64, _F64, _I64, _I64, _F64, _I64]),
-    "cfx_sg1_decode": (None, [_I64, _I64, _I64, _I64, _I64, _I64, _I64, _F64, _I64]),
-    "cfx_sg2_decode": (None, [_I64, _I64, _I64, _I64, _I64, _I64, _I64, _F64, _I64]),
-    "cfx_sigma_z_decode": (None, [_I64, _I64, _I64, _I64, _I64, _I64, _F64, _I64, _I64]),
-    "cfx_double_sigma_decode": (None, [_I64, _I64, _I64, _I64, _I64, _F64, _I64, _I64, _F64, _I64, _I64, _F64, _I64, _I64, _F64, _I64, _I64, _F64, _I64]),
-    "cfx_guess_bounds_1d": (None, [_I64, _I64, _I64]),
-    "cfx_axis_order": (None, [_I64, _I64, _I64]),
-    "cfx_extract_flags": (None, [_I64, _I64, _I64, _I64, _I64, _I64, _I64]),
+    "atmosphere_ln_pressure_decode": (None, [_I64] * 4),
+    "atmosphere_sigma_decode": (None, [_I64] * 5),
+    "atmosphere_hybrid_sigma_pressure_decode": (None, [_I64] * 5 + [_I64] * 2 + [_I64] * 2),
+    "atmosphere_hybrid_height_decode": (None, [_I64] * 5),
+    "atmosphere_sleve_decode": (None, [_I64] * 8),
+    "ocean_sigma_decode": (None, [_I64] * 5),
+    "ocean_s_decode": (None, [_I64] * 4 + [_I64, _I64] * 3 + [_I64]),
+    "ocean_sg1_decode": (None, [_I64] * 8),
+    "ocean_sg2_decode": (None, [_I64] * 8),
+    "ocean_sigma_z_decode": (None, [_I64] * 8),
+    "ocean_double_sigma_decode": (None, [_I64] * 4 + [_I64, _I64] * 4 + [_I64] * 2),
+    "guess_bounds_1d": (None, [_I64] * 3),
+    "guess_bounds_2d": (None, [_I64] * 4),
+    "get_core_dim_order": (None, [_I64] * 3),
+    "extract_flags": (None, [_I64] * 7),
+    "simd_width": (_F64, []),
+    "bounds_helper_2d": (None, [_I64] * 5),
+    "ordered_vertices": (None, [_I64] * 6),
+    "sort_vertices": (None, [_I64] * 6),
+    "vertices_to_bounds_1d": (None, [_I64] * 3),
+    "vertices_to_bounds_2d": (None, [_I64] * 4),
+    "max_workers": (_F64, []),
 }
 
 
@@ -73,8 +84,6 @@ def _load() -> SimpleNamespace:
         fn = getattr(cdll, name, None)
         if fn is None:
             raise RuntimeError(f"symbol {name} missing from {_LIB_PATH}")
-        if len(argtypes) == 0:
-            raise RuntimeError(f"empty argtypes for {name}")
         fn.restype = restype
         fn.argtypes = argtypes
         setattr(ns, name, _Checked(fn, name, len(argtypes)))
@@ -89,7 +98,3 @@ def addr(a: np.ndarray) -> int:
     if not a.flags["C_CONTIGUOUS"]:
         raise ValueError("buffer must be C-contiguous")
     return int(a.ctypes.data)
-
-
-def f64(x) -> ctypes.c_double:
-    return ctypes.c_double(float(x))

@@ -69,6 +69,25 @@ def test_guess_bounds_2d_matches_upstream(rng):
     assert_allclose(ours, ref.values, rtol=1e-12, atol=1e-10, equal_nan=True)
 
 
+@pytest.mark.parametrize("shape", [(2, 2), (3, 200), (200, 3), (9, 260), (130, 131)])
+def test_guess_bounds_2d_matches_upstream_across_the_tile_boundary(shape):
+    """The kernel tiles the second axis, so it is run past `TILE = 128` columns.
+
+    Each tile re-reads the row before it and the row after it and pads both
+    sides with the NaN columns an edge cell averages over, so a shape whose
+    second axis is not a multiple of the tile width exercises a different set
+    of boundary columns than one that is.
+    """
+    n, m = shape
+    c = np.add.outer(
+        np.linspace(-80.0, 80.0, n), np.linspace(-170.0, 170.0, m)
+    ).astype(np.float64)
+    ref = ch._guess_bounds_2d(xr.DataArray(c, dims=("y", "x")), ("y", "x"))
+    ours = mcf.guess_bounds_2d(c)
+    assert ours.shape == ref.shape == (n, m, 4)
+    assert_allclose(ours, ref.values, rtol=1e-12, atol=1e-10, equal_nan=True)
+
+
 def test_axis_order_matches_upstream(rng):
     cases = {
         "asc": np.arange(20, dtype=np.float64),

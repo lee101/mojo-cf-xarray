@@ -1,10 +1,13 @@
 # Mojo dialect notes (verified by probe against the pinned compiler, not by docs)
 
-Toolchain these notes describe: `mojo ==1.2.0.dev2026092605` (set in `MOJO_PIN` in
-`bin/port.sh`; every repo receives this file with the marker already substituted).
-Every claim below was checked by compiling it. `bin/probe-confirm.py` and
-`bin/probe-hints.py` in the factory regenerate the list; re-run them after any
-toolchain bump rather than trusting this file.
+These notes are kept in the repo because every claim in them was checked by
+compiling it, and two of them -- the `max` package requirement and the
+subscript-fold hazard in section 5c -- cost real time to characterise. They are
+factory notes, carried over from the porting harness: they describe the toolchain
+this repository pins (`mojo ==1.2.0.dev2026092905`) and `bin/probe-confirm.py`
+and `bin/probe-hints.py` in that harness regenerate sections 1 to 4. Nothing in
+here is specific to this port except where a bullet says so; re-run the probes
+after any toolchain bump rather than trusting the file.
 
 ## 0. Two things that break everything if you forget them
 
@@ -144,8 +147,8 @@ pin; it is released in lockstep, so `mojo ==X` goes with `max ==matching-version
 
 ```toml
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
-max  = "==26.7.0.dev2026092605"
+mojo = "==1.2.0.dev2026092905"
+max  = "==26.7.0.dev2026092905"
 ```
 
 **`parallelize` signature changed.** The bracket form no longer type-checks:
@@ -174,6 +177,50 @@ chunk (mojo-eigen's batched GPU SVD asks for 16.75 GiB and gets
 `CUDA_ERROR_OUT_OF_MEMORY`) and a broad `except` will swallow that into a silent
 CPU fallback. If a GPU path "works" but never reports `used_gpu=1`, it is probably
 running on the CPU — check rather than assume.
+
+## 5c. The subscript-fold hazard (measured, three ways, on 1.2.0)
+
+This is not in the existing notes because it cost most of an afternoon to
+characterise, and it is the single thing most likely to make a future pass
+write a kernel that is silently wrong. **A subscript pattern that is the sum or
+difference of two related offsets gets folded back over the store or the load
+it feeds, and the compiler inverts the write order.** The kernel still compiles
+cleanly, runs, and produces rows whose elements are duplicated at the wrong
+end.
+
+Reproduced shapes, all in one bottom-up merge sort over a row:
+
+| written as | what comes back |
+| --- | --- |
+| `to[i] = from[nv - 1 - i]` over a descending loop | correct, standalone |
+| `out[k] = last[nv - 1 - k]` where `k` counts down from `nv` | the ascending sort, twice over: `out[0] = in[nv-1]` and `out[nv-1] = in[nv-1]` |
+| the same through a `Pointer` parameter selected by an `if` | the row comes back with `out[0]` written as `in[nv-1]` three times, then garbage |
+| the same with the destination spelled as an index (`k * nv`) rather than a pointer | `mojo build` **segfaults** while compiling, before anything runs |
+| `dst.unsafe_store(2 * i, lo); dst.unsafe_store(2 * i + W, hi)` where `hi` was loaded at `i + n` | contiguous, un-interleaved output; and once `parallelize` is enabled, the first three elements of every row at a worker's chunk start are wrong |
+
+The rule that falls out of it, and the one this repo follows: **inside one
+loop, every subscript is either a plain forward index or a whole-run offset
+that is a multiple of the run length, and no two subscripts are related by
+doubling.** The `[2i, 2i + 2w)` "half-offset" pattern is exactly what an
+in-place merge widening needs, and it is exactly what cannot be written.
+
+Two more things the same work turned up:
+
+- **`read`, `write`, `desc`, `in`, `out`, `imm` are effect names.** Using one
+  as a parameter is `error: expected argument name`. Pick something else.
+- **`SIMD[a, 2n](x, y)` with two `SIMD[a, n]` does not exist.** There is no
+  constructor that joins two narrower vectors. The only way to build a wide
+  `SIMD` from narrower loads is `bitcast[DType.float64, 2 * W](lo)` followed by
+  assigning the high half, and per MOJO_NOTES section 1 the element assignment
+  on a `SIMD` is a no-op on this toolchain. Where the result is
+  `SIMD[float64, 2]`, build it from two `Float64`s and store that.
+
+And the perf consequence worth knowing before choosing a shape: a loop of
+`SIMD[float64, 2]` stores over contiguous input runs at about **15 GB/s per
+core** on a 2.3 GHz Broadwell with `W = 4` (`simd_width_of` is 4 there, there
+is no AVX-512), which is memory speed. Splitting such a loop over 16 workers
+made it five times slower. Widening past `W` buys nothing on that box either;
+`-march=native` is a no-op in this build, so `W` stays 4.
 
 ## 6. Build
 

@@ -11,7 +11,7 @@ import pytest
 from numpy.testing import assert_allclose
 
 import mojo_cf_xarray as mcf
-from mojo_cf_xarray._lib import addr, lib
+from mojo_cf_xarray._lib import _SIGNATURES, addr, lib
 
 
 def test_addr_rejects_non_contiguous_input():
@@ -24,11 +24,11 @@ def test_addr_rejects_non_contiguous_input():
 def test_every_symbol_checks_its_arity():
     """ctypes zero-fills a short argtypes list, so a dropped argument truncates."""
     with pytest.raises(TypeError):
-        lib.cfx_guess_bounds_1d(4, 0)
+        lib.guess_bounds_1d(4, 0)
     with pytest.raises(TypeError):
-        lib.cfx_axis_order(4, 0, 0, 0)
+        lib.get_core_dim_order(4, 0, 0, 0)
     with pytest.raises(TypeError):
-        lib.cfx_extract_flags(4, 1, 0, 0, 0, 0)
+        lib.extract_flags(4, 1, 0, 0, 0, 0)
 
 
 def test_buffers_above_four_gib_round_trip():
@@ -73,8 +73,32 @@ def test_buffers_above_four_gib_round_trip():
         libc.munmap(addr_here, size)
 
 
-def test_symbol_arity_is_declared_for_every_export():
-    names = [n for n in dir(lib) if n.startswith("cfx_")]
-    assert len(names) == 12
-    for name in names:
-        assert getattr(lib, name).arity >= 3
+def test_every_export_is_declared_and_arity_checked():
+    """A kernel that is not in the table silently has no argtypes at all."""
+    expected = {
+        "atmosphere_ln_pressure_decode",
+        "atmosphere_sigma_decode",
+        "atmosphere_hybrid_sigma_pressure_decode",
+        "atmosphere_hybrid_height_decode",
+        "atmosphere_sleve_decode",
+        "ocean_sigma_decode",
+        "ocean_s_decode",
+        "ocean_sg1_decode",
+        "ocean_sg2_decode",
+        "ocean_sigma_z_decode",
+        "ocean_double_sigma_decode",
+        "guess_bounds_1d",
+        "guess_bounds_2d",
+        "get_core_dim_order",
+        "extract_flags",
+        "simd_width",
+        "max_workers",
+        "bounds_helper_2d",
+        "ordered_vertices",
+        "sort_vertices",
+        "vertices_to_bounds_1d",
+        "vertices_to_bounds_2d",
+    }
+    assert set(_SIGNATURES) == expected
+    for name, (_restype, argtypes) in _SIGNATURES.items():
+        assert getattr(lib, name).arity == len(argtypes)

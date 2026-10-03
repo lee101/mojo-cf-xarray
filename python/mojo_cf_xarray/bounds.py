@@ -35,30 +35,14 @@ def _f64(a) -> np.ndarray:
     return np.ascontiguousarray(a, dtype=np.float64)
 
 
-def _bounds_last_axis(values: np.ndarray) -> np.ndarray:
-    """Apply the 1-D rule along the last axis of a C-contiguous array."""
-    n = values.shape[-1]
+def _bounds_1d(coord: np.ndarray) -> np.ndarray:
+    """Apply the 1-D rule to a 1-D contiguous coordinate, as `(N, 2)`."""
+    n = coord.shape[0]
     if n < 2:
         raise ValueError("need at least two coordinates to guess bounds")
-    flat = values.reshape(-1, n)
-    # the kernel handles one contiguous vector, so walk the rows
-    in_base = addr(flat)
-    out = np.empty(flat.size * 2, dtype=np.float64)
-    out_base = addr(out)
-    for row in range(flat.shape[0]):
-        lib.cfx_guess_bounds_1d(
-            n, in_base + row * n * 8, out_base + row * n * 16
-        )
-    return out.reshape(values.shape + (2,))
-
-
-def _bounds_axis(values: np.ndarray, axis: int) -> np.ndarray:
-    """Apply the 1-D rule along `axis`, adding a trailing bounds axis."""
-    moved = np.ascontiguousarray(np.moveaxis(values, axis, -1))
-    # out keeps the working axis, so the result is the input shape with a
-    # length-2 bounds axis appended -- which is what the upstream
-    # `concat(..., dim="bounds").transpose(..., "bounds")` produces
-    return np.moveaxis(_bounds_last_axis(moved), -2, axis)
+    out = np.empty(n * 2, dtype=np.float64)
+    lib.guess_bounds_1d(n, addr(coord), addr(out))
+    return out.reshape(n, 2)
 
 
 def guess_bounds_1d(coord: np.ndarray) -> np.ndarray:
@@ -74,79 +58,33 @@ def guess_bounds_1d(coord: np.ndarray) -> np.ndarray:
     coord = _f64(coord)
     if coord.ndim != 1:
         raise ValueError("coord must be one-dimensional")
-    return _bounds_last_axis(coord).reshape(coord.shape + (2,))
+    return _bounds_1d(coord)
 
 
 def guess_bounds_2d(coord: np.ndarray) -> np.ndarray:
     """Bounds of a 2-D curvilinear coordinate, shape `(N, M, 4)`.
 
-    This is `cf_xarray.helpers._guess_bounds_2d`: apply the 1-D rule along
-    each axis in turn, pad with NaN, then average the four corners that
-    should describe the same point. The corner averaging is forwarded to
-    `numpy.nanmean`, which is the upstream formulation and has the
-    all-NaN-slice behaviour the upstream code relies on.
+    This is `cf_xarray.helpers._guess_bounds_2d`, in the same three steps: the
+    1-D rule along the first axis, the 1-D rule again along the second axis of
+    that result, then the average of the four corner estimates a cell shares
+    with its neighbours, NaN-padded so an edge cell averages only the corners
+    it actually has. The corner averaging is `numpy.nanmean` upstream and
+    `_nanmean4` in the kernel, including the all-NaN case.
+
+    The kernel runs all three over a rolling three-row window, so the
+    coordinate is read once and only the `(N, M, 4)` result is written; the
+    shim no longer materialises the `(N, M, 2)` and `(N, M, 2, 2)`
+    intermediates, which is where the time used to go.
     """
     coord = _f64(coord)
     if coord.ndim != 2:
         raise ValueError("coord must be two-dimensional")
-    # upstream applies the 1-D rule along the first axis and then applies it
-    # again to the *result* along the second axis, so the second pair of edges
-    # is a function of the first pair rather than of the original coordinate
-    along_first = _bounds_axis(coord, 0)  # (N, M, 2)
-    corners = _bounds_axis(along_first, 1)  # (N, M, 2, 2) as [Xbnds, Ybnds]
-    padded = np.pad(
-        corners, ((1, 1), (1, 1), (0, 0), (0, 0)), mode="constant", constant_values=np.nan
-    )
-    # counter-clockwise from the lower left corner
-    return np.stack(
-        (
-            np.nanmean(
-                np.stack(
-                    (
-                        padded[:-2, :-2, 1, 1],
-                        padded[:-2, 1:-1, 1, 0],
-                        padded[1:-1, 1:-1, 0, 0],
-                        padded[1:-1, :-2, 0, 1],
-                    )
-                ),
-                axis=0,
-            ),
-            np.nanmean(
-                np.stack(
-                    (
-                        padded[:-2, 1:-1, 1, 1],
-                        padded[:-2, 2:, 1, 0],
-                        padded[1:-1, 2:, 0, 0],
-                        padded[1:-1, 1:-1, 0, 1],
-                    )
-                ),
-                axis=0,
-            ),
-            np.nanmean(
-                np.stack(
-                    (
-                        padded[1:-1, 1:-1, 1, 1],
-                        padded[1:-1, 2:, 1, 0],
-                        padded[2:, 2:, 0, 0],
-                        padded[2:, 1:-1, 0, 1],
-                    )
-                ),
-                axis=0,
-            ),
-            np.nanmean(
-                np.stack(
-                    (
-                        padded[1:-1, :-2, 1, 1],
-                        padded[1:-1, 1:-1, 1, 0],
-                        padded[2:, 1:-1, 0, 0],
-                        padded[2:, :-2, 0, 1],
-                    )
-                ),
-                axis=0,
-            ),
-        ),
-        axis=-1,
-    )
+    n, m = coord.shape
+    if n < 2 or m < 2:
+        raise ValueError("need at least two coordinates along each axis")
+    out = np.empty((n, m, 4), dtype=np.float64)
+    lib.guess_bounds_2d(n, m, addr(coord), addr(out))
+    return out
 
 
 def axis_order(coord: np.ndarray) -> str:
@@ -158,12 +96,30 @@ def axis_order(coord: np.ndarray) -> str:
     point or of all-equal values reads as ascending, and an axis containing a
     NaN reads as mixed.
     """
-    coord = _f64(coord)
+    values = np.asarray(coord)
+    if values.dtype.kind in "mM" and np.isnat(values).any():
+        # upstream takes the difference in datetime64 and only then casts, so a
+        # NaT sentinel shows up in the one difference that touches it; a float64
+        # view of the coordinate would contaminate the next step as well
+        return _CODES[_classify(np.diff(values).astype("float64"))]
+    coord = _f64(values)
     if coord.size <= 1:
         return ASCENDING
     out = np.zeros(1, dtype=np.float64)
-    lib.cfx_axis_order(coord.size, addr(coord), addr(out))
+    lib.get_core_dim_order(coord.size, addr(coord), addr(out))
     return _CODES[int(out[0])]
+
+
+def _classify(diffs) -> int:
+    """0 ascending, 1 descending, 2 mixed -- the reduction the kernel does."""
+    nonzero = diffs[diffs != 0]
+    if nonzero.size == 0:
+        return 0
+    if np.all(nonzero > 0):
+        return 0
+    if np.all(nonzero < 0):
+        return 1
+    return 2
 
 
 def is_bounds_monotonic(bounds: np.ndarray) -> bool:

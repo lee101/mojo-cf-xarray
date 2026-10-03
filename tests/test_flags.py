@@ -116,3 +116,47 @@ def test_extract_flags_preserves_shape():
     got = mcf.extract_flags(values, masks)
     assert got["even"].shape == (3, 4)
     assert_array_equal(got["odd"], (values.astype(np.int64) & 1) != 0)
+
+
+def test_extract_flags_on_a_dataarray_returns_upstreams_dataset():
+    """Passing the variable itself is `DataArray.cf._extract_flags()`.
+
+    Same variables, same keys, and the same `Dataset` structure: each mask is
+    a bool variable named for its meaning, carrying the flag variable's dims,
+    coords and attributes, in a `Dataset` with no attributes of its own.
+    """
+    cases = [
+        {"flag_meanings": "good suspect", "flag_values": [0, 1], "flag_masks": [1, 2]},
+        {"flag_meanings": "good suspect", "flag_values": [0, 1]},
+        {"flag_meanings": "good suspect", "flag_masks": [1, 2]},
+    ]
+    values = np.array([0, 1, 2, 3, 0], dtype=np.int16)
+    for attrs in cases:
+        da = xr.DataArray(
+            values,
+            dims=("cell",),
+            coords={"cell": np.arange(5)},
+            name="quality",
+            attrs=attrs,
+        )
+        ours = mcf.extract_flags(da)
+        theirs = da.cf._extract_flags()
+        assert isinstance(ours, xr.Dataset)
+        assert set(ours.data_vars) == set(theirs.data_vars)
+        assert dict(ours.attrs) == dict(theirs.attrs) == {}
+        for key in theirs.data_vars:
+            assert ours[key].dims == theirs[key].dims
+            assert ours[key].name == theirs[key].name == key
+            assert dict(ours[key].attrs) == dict(theirs[key].attrs)
+            assert_array_equal(ours[key].values, theirs[key].values)
+
+
+def test_create_flag_dict_is_upstreams():
+    """The `{meaning: (mask, value)}` mapping, under both of its names."""
+    from cf_xarray.accessor import create_flag_dict as upstream
+
+    da = flag_da(
+        np.array([0, 1, 2, 3], dtype=np.int16), [1, 2, 4], ["good", "low", "high"]
+    )
+    assert mcf.create_flag_dict is mcf.flag_dict
+    assert mcf.create_flag_dict(da) == upstream(da)
