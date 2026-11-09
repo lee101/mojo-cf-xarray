@@ -219,71 +219,74 @@ of the same formula rather than the `xarray` call, which is dominated by
 accessor plumbing this port forwards.
 
 Measured on **72 vCPU Intel Xeon E5-2697 v4 @ 2.30 GHz, 251 GiB RAM, Linux
-6.8.0-142-generic, Python 3.13.14, NumPy 2.5.1, xarray 2026.7.0, Mojo
+6.8.0-147-generic, Python 3.13.14, NumPy 2.5.1, xarray 2026.7.0, Mojo
 1.2.0.dev2026092905**, under the machine-wide `flock` the `bench` pixi task
-holds. The box is shared and nothing pins it, so the absolute times move a lot
-between runs -- `guess_bounds_1d`'s reference column has ranged from 126 ms to
-218 ms and its speedup from 8.0x to 16.8x across four runs of this table. Read
-the port's own column as the stable number, and every ratio here as the median
-of the runs that produced it.
-
-The table below is one run of `pixi run bench` on this checkout, which prints
-the table itself. Two rows carry a range instead of a point because their
+holds. The box is shared and nothing pins it, so the absolute times move between
+runs. The table below is the per-case median of five `pixi run bench` runs in
+the VERIFY session (2026-11-09); see `bench/verify.md` for the five raw tables,
+the per-row spread, and which rows moved. Every ratio is the median of the
+ratios from those runs. Two rows carry a range instead of a point because their
 spread is larger than their margin:
 
 | case | reference | mojo-cf-xarray | speedup |
 | --- | ---: | ---: | ---: |
-| guess_bounds_1d n=4194304 | 132.22 ms | 13.72 ms | 9.64x |
-| guess_bounds_2d 2048x2048 | 2171.23 ms | 152.59 ms | 14.23x |
-| axis_order n=8388608 (ascending) | 86.13 ms | 9.24 ms | 9.32x |
-| atmosphere_ln_pressure n=4194304 | 65.46 ms | 23.84 ms | 2.75x |
-| atmosphere_hybrid_sigma n=4194304 | 21.87 ms | 12.56 ms | 1.74x |
-| ocean_s n=2097152 | 176.38 ms | 17.14 ms | 10.29x |
-| ocean_double_sigma n=2097152 | 99.10 ms | 10.67 ms | 9.28x |
-| extract_flags n=4194304 x 8 | 176.47 ms | 24.17 ms | 7.30x |
-| get_ordered_vertices 1024x1024 | 14.00 ms | 25.99 ms | 0.54x (0.54-0.63x) |
-| sort_vertices 4096x1024 | 72.77 ms | 62.99 ms | 1.16x (1.06-1.16x) |
-| vertices_to_bounds_1d n=4194304 | 27.11 ms | 24.53 ms | 1.11x |
+| guess_bounds_1d n=4194304 | 126.14 ms | 13.09 ms | 10.17x |
+| guess_bounds_2d 2048x2048 | 1657.46 ms | 149.24 ms | 11.05x |
+| axis_order n=8388608 (ascending) | 82.55 ms | 8.53 ms | 9.48x |
+| atmosphere_ln_pressure n=4194304 | 59.48 ms | 21.25 ms | 2.85x |
+| atmosphere_hybrid_sigma n=4194304 | 21.59 ms | 10.88 ms | 1.98x |
+| ocean_s n=2097152 | 162.90 ms | 16.63 ms | 9.81x |
+| ocean_double_sigma n=2097152 | 97.07 ms | 9.63 ms | 10.11x |
+| extract_flags n=4194304 x 8 | 114.87 ms | 19.47 ms | 5.90x |
+| get_ordered_vertices 1024x1024 | 13.96 ms | 21.81 ms | 0.63x (0.62-0.77x) |
+| sort_vertices 4096x1024 | 46.76 ms | 50.61 ms | 0.88x (0.77-1.23x) |
+| vertices_to_bounds_1d n=4194304 | 29.95 ms | 24.87 ms | 1.22x |
 
 Everything above except `get_ordered_vertices` and `sort_vertices` wins by a
 margin far larger than its spread. Those two are close enough to parity that
 the single-run ratio would be overclaiming, so they carry the range across the
-four runs. What the losing row hides is worth spelling out:
+five runs. `sort_vertices` is slower than NumPy in the median and faster in
+one of the five runs; read it as parity that leans slower, not as a win. What
+the losing row hides is worth spelling out:
 
 - **`get_ordered_vertices` is slower than NumPy, and the sort is where it goes.**
   The call does two things: `ordered_vertices` builds the `(N + 1,)` vertices and
-  `sort_vertices` sorts them. Measured at 1024x1024 on this box, the two stages
-  called directly through the FFI against their NumPy equivalents:
+  `sort_vertices` sorts them. Measured at 1024x1024 this session, the two stages
+  called directly through the FFI against their NumPy equivalents (warmed
+  output buffers, best of seven; see `bench/verify.md` §3):
 
   | stage | this port | numpy equivalent |
   | --- | ---: | ---: |
-  | build the vertices | 0.96 ms | 1.14 ms (`np.concatenate`) |
-  | sort them | 11.2 ms | 11.7 ms (`np.sort`) |
-  | the whole call | 22-26 ms | 14-16 ms |
+  | build the vertices | 1.79 ms | 1.00 ms (`np.concatenate`) |
+  | sort them | 11.35 ms | 12.20 ms (`np.sort`) |
+  | the whole call | 21.68-23.17 ms (5 bench runs) | 13.37-16.76 ms (5 bench runs) |
 
-  Both stages are at or ahead of NumPy on their own, and the sum is still
-  behind, which means the gap is not arithmetic. `get_ordered_vertices` stages
-  its result through an intermediate and hands the sort a fresh `(rows, n + 1)`
-  array: two extra full passes over 8 MiB of allocation plus first-touch. The
-  build being the faster of the two stages is the payoff of the interleaved
-  `SIMD[float64, 2]` store -- the pair of bounds of a cell is adjacent in
-  memory, so the result is one vector store per cell, where the loop it
-  replaced assembled each from two scalar loads and two scalar stores.
-- **`sort_vertices` at 4096x1024 is 1.06x to 1.16x** against `np.sort` across
-  four runs. Read it as parity rather than as a win. NumPy's
-  `np.sort(axis=-1)` is a multithreaded introsort that splits *within* a row;
-  the merge here parallelises *across* rows, and the copy-per-pass described
-  under "The sort and the pointer swap" moves a quarter more memory than the
-  merges need. At 4096 rows there are enough of them to fill sixteen workers,
-  which is the only reason it is not behind.
-- **`vertices_to_bounds_1d` is 1.11x.** The kernel is a straight copy of the
+  The sort is at or ahead of NumPy on its own, and the build is not: on the
+  bench input (non-monotonic, so the `minimum` branch) the kernel runs at
+  1.79 ms to NumPy's 1.00 ms, and the monotonic path would be 1.01 ms instead.
+  The whole call is still further behind both stages together, which means the
+  gap is not arithmetic. `get_ordered_vertices` stages its result through an
+  intermediate and hands the sort a fresh `(rows, n + 1)` array: two extra full
+  passes over 8 MiB of allocation plus first-touch. The copy the rows need is
+  where the time goes, not the store: the interleaved `SIMD[float64, 2]` store
+  is one vector store per cell, where the loop it replaced assembled each from
+  two scalar loads and two scalar stores, but the min-branch arithmetic that
+  the bench input takes is not that store.
+- **`sort_vertices` at 4096x1024 is 0.77x to 1.23x, median 0.88x,** against
+  `np.sort` across five runs. Read it as parity that leans slower, not as a
+  win. NumPy's `np.sort(axis=-1)` is a multithreaded introsort that splits
+  *within* a row; the merge here parallelises *across* rows, and the copy-per-pass
+  described under "The sort and the pointer swap" moves a quarter more memory
+  than the merges need. At 4096 rows there are enough of them to fill sixteen
+  workers, which is the only reason the gap stays this small.
+- **`vertices_to_bounds_1d` is 1.22x.** The kernel is a straight copy of the
   shifted slices and is bandwidth-bound; there is little to win and the row is
   within the noise of the allocation.
 - **`ocean_s` and `atmosphere_ln_pressure` are the transcendentals.** They are
   the only kernels that call `std.math`'s `exp`, `sinh` and `tanh`, so their
-  speed is vectorisation rather than memory traffic: `ocean_s` runs at 10.29x
+  speed is vectorisation rather than memory traffic: `ocean_s` runs at 9.81x
   and `atmosphere_ln_pressure`, which is one `exp` per element over the same
-  bytes, at 2.75x.
+  bytes, at 2.85x.
 - **`ocean_double_sigma` wins for a structural reason as well as a
   vectorisation one:** NumPy's `np.where` evaluates both branches and
   materialises a boolean mask, while the kernel blends two computed vectors.
@@ -301,7 +304,7 @@ four runs. What the losing row hides is worth spelling out:
   flags instead of once per flag.
 - **The linear decoders** are the rest of the story, and the smallest win:
   `atmosphere_hybrid_sigma` is three flops per twenty-four bytes on both
-  sides, and it is 1.74x.
+  sides, and it is 1.98x.
 
 ### What was tried and did not pay
 
@@ -316,14 +319,15 @@ four runs. What the losing row hides is worth spelling out:
   while the result is written as four-double groups, so worker threads scatter
   partial-line stores across the 128 MiB output. This kernel stays serial.
 - **A row-parallel `ordered_vertices`.** This is the same shape of kernel and
-  the opposite answer, which is why both are measured rather than assumed. With
-  the `SIMD[float64, 2]` store in place the serial loop runs at 0.96 ms for
-  1024x1024, which is memory speed for 16 MiB in and 8 MiB out, and the split
-  version was measured at five times that. Sixteen workers each walk a strided
-  window of the same bounds, and the cost is in the memory system, not in the
-  loop. So this kernel is left serial even though it is a gather and
-  `guess_bounds_1d`, which is also a gather, pays for the same split. The
-  kernel's docstring says so.
+  the opposite answer, which is why both are measured rather than assumed. On
+  the monotonic path the serial loop runs at 1.01 ms for
+  1024x1024 (measured this session, warmed buffer), which is memory speed for
+  16 MiB in and 8 MiB out; the non-monotonic `minimum` branch the bench input
+  takes runs at 1.79 ms instead. The split version was measured at five times
+  that. Sixteen workers each walk a strided window of the same bounds, and the
+  cost is in the memory system, not in the loop. So this kernel is left serial
+  even though it is a gather and `guess_bounds_1d`, which is also a gather,
+  pays for the same split. The kernel's docstring says so.
 - **`get_core_dim_order` is left serial** for the same reason as
   `guess_bounds_2d`, plus one more: it is a reduction, so a chunked version
   needs a per-chunk partial that the ABI has nowhere to put. At 8 Mi-element it
@@ -424,9 +428,9 @@ kernels through the FFI, best of seven:
 
 | kernel | 1 worker | 16 workers | ratio |
 | --- | ---: | ---: | ---: |
-| `ocean_s`, n = 2097152 | 78.4 ms | 12.2 ms | 6.4x |
-| `atmosphere_ln_pressure`, n = 4194304 | 17.0 ms | 9.8 ms | 1.7x |
-| `guess_bounds_1d`, n = 4194304 | 14.4 ms | 10.7 ms | 1.4x |
+| `ocean_s`, n = 2097152 | 78.0 ms | 13.2 ms | 5.9x |
+| `atmosphere_ln_pressure`, n = 4194304 | 17.4 ms | 10.3 ms | 1.7x |
+| `guess_bounds_1d`, n = 4194304 | 15.2 ms | 12.4 ms | 1.2x |
 
 The shape of that is the point. `ocean_s` is compute the single core cannot
 keep up with, so it gains the most; the other two are waiting on memory, so
